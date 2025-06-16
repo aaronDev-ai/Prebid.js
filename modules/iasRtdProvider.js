@@ -5,6 +5,7 @@ import {getGlobal} from '../src/prebidGlobal.js';
 import {getAdUnitSizes} from '../libraries/sizeUtils/sizeUtils.js';
 import {getGptSlotInfoForAdUnitCode} from '../libraries/gptUtils/gptUtils.js';
 
+import { mergeDeep } from '../src/utils.js';
 /**
  * @typedef {import('../modules/rtdModule/index.js').RtdSubmodule} RtdSubmodule
  */
@@ -201,21 +202,117 @@ function isValidHttpUrl(string) {
   return url.protocol === 'http:' || url.protocol === 'https:';
 }
 
-export function getApiCallback() {
+/**
+ * Maps data using IAS_KEY_MAPPINGS
+ * @param {Object} data - The data to map
+ * @return {Object} The mapped data
+ */
+function mapIasData(data) {
+  const mappedData = {};
+
+  Object.entries(data).forEach(([key, value]) => {
+    if (value !== undefined && IAS_KEY_MAPPINGS.hasOwnProperty(key)) {
+      mappedData[IAS_KEY_MAPPINGS[key]] = value;
+    }
+  });
+
+  return mappedData;
+}
+
+/**
+ * Inject brand safety data into ortb2Fragments
+ * @param {Object} brandSafetyData - The brand safety data
+ * @param {Object} ortb2Fragments - The ortb2 fragments object
+ */
+function injectBrandSafetyData(brandSafetyData, ortb2Fragments) {
+  if (!brandSafetyData || !ortb2Fragments?.global) return;
+
+  // Map the brand safety data
+  const mappedData = mapIasData(brandSafetyData);
+  if (Object.keys(mappedData).length === 0) return;
+
+  // Add to site.ext.data
+  mergeDeep(ortb2Fragments.global, { site: { ext: { data: mappedData } } });
+
+  // Add to site.keywords
+  const keywordsArray = Object.entries(mappedData)
+    .map(([key, value]) => `${key}=${value}`);
+
+  if (keywordsArray.length > 0) {
+    const keywordsString = keywordsArray.join(',');
+    const existingKeywords = ortb2Fragments.global?.site?.keywords;
+
+    // Ensure site object exists
+    if (!ortb2Fragments.global.site) ortb2Fragments.global.site = {};
+
+    // Update keywords
+    ortb2Fragments.global.site.keywords = existingKeywords
+      ? `${existingKeywords},${keywordsString}`
+      : keywordsString;
+  }
+}
+
+/**
+ * Inject slot-specific data into adUnits
+ * @param {Object} slotsData - The slots data
+ * @param {Array} adUnits - The ad units array
+ */
+function injectSlotData(slotsData, adUnits) {
+  if (!slotsData || !adUnits?.length) return;
+
+  adUnits.forEach(adUnit => {
+    const slotInfo = slotsData[adUnit.code];
+    if (!slotInfo) return;
+
+    // Map the slot data
+    const mappedSlotData = mapIasData(slotInfo);
+
+    // Only inject if we have mapped data
+    if (Object.keys(mappedSlotData).length > 0) {
+      mergeDeep(adUnit, { ortb2Imp: { ext: { data: mappedSlotData } } });
+    }
+  });
+}
+
+/**
+ * Creates a callback for the IAS API response
+ * @param {Object} reqBidsConfigObj - The bid request config object
+ * @return {Object} The callback object
+ */
+export function getApiCallback(reqBidsConfigObj, callback) {
   return {
     success: function (response, req) {
       if (req.status === 200) {
         try {
           parseResponse(response);
+          const data = iasTargeting;
+          if (!data) {
+            utils.logInfo('IAS RTD: No data after parsing response');
+            callback();
+            return;
+          }
+
+          // 1. Inject page-level brand safety data
+          injectBrandSafetyData(data.brandSafety, reqBidsConfigObj.ortb2Fragments);
+
+          // 2. Inject impression-specific data
+          injectSlotData(data.slots, reqBidsConfigObj.adUnits);
+
+          callback();
         } catch (e) {
-          utils.logError('Unable to parse IAS response.', e);
+          utils.logError('Unable to parse IAS response', e);
+          callback();
         }
+      } else {
+        utils.logInfo('IAS RTD: Non-200 status code:', req.status);
+        callback();
       }
     },
     error: function () {
       utils.logError('failed to retrieve IAS data');
+      callback();
     }
-  }
+  };
 }
 
 function getBidRequestData(reqBidsConfigObj, callback, config, userConsent) {
@@ -229,11 +326,10 @@ function getBidRequestData(reqBidsConfigObj, callback, config, userConsent) {
   const queryString = constructQueryString(pubId, adUnits, pageUrl, adUnitPath);
   ajax(
     `${IAS_HOST}?${queryString}`,
-    getApiCallback(),
+    getApiCallback(reqBidsConfigObj, callback),
     undefined,
     { method: 'GET' }
   );
-  callback()
 }
 
 /** @type {RtdSubmodule} */
